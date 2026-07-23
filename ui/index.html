@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Play vs Engine</title>
+<style>
+  :root {
+    --light: #f0d9b5;
+    --dark: #b58863;
+    --select: #6a9955aa;
+    --dest: #4a90d966;
+    --check: #d95c5caa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #1e1e1e;
+    color: #ddd;
+    display: flex;
+    justify-content: center;
+    padding: 24px;
+  }
+  .app {
+    display: flex;
+    gap: 32px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .board {
+    display: grid;
+    grid-template-columns: repeat(8, 64px);
+    grid-template-rows: repeat(8, 64px);
+    border: 2px solid #444;
+    width: max-content;
+  }
+  .sq {
+    width: 64px;
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 42px;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    position: relative;
+  }
+  .sq.light { background: var(--light); }
+  .sq.dark { background: var(--dark); }
+  .sq.selected::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: var(--select);
+  }
+  .sq.dest::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: var(--dest);
+  }
+  .sq.king-check::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: var(--check);
+  }
+  .piece-white { color: #fff; text-shadow: 0 0 2px #000, 0 0 2px #000; }
+  .piece-black { color: #111; text-shadow: 0 0 2px #fff; }
+
+  .panel {
+    min-width: 280px;
+  }
+  .panel h1 { font-size: 18px; margin: 0 0 12px; }
+  .row { margin-bottom: 12px; }
+  label { display: block; font-size: 12px; color: #999; margin-bottom: 4px; }
+  select, button {
+    background: #2d2d2d;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 14px;
+  }
+  button {
+    cursor: pointer;
+    margin-right: 8px;
+  }
+  button:hover { background: #3a3a3a; }
+  #status { font-size: 15px; margin: 12px 0; min-height: 20px; }
+  #status.think { color: #e0c060; }
+  #status.over { color: #e05c5c; font-weight: bold; }
+  #history {
+    font-size: 13px;
+    max-height: 300px;
+    overflow-y: auto;
+    background: #262626;
+    border: 1px solid #383838;
+    border-radius: 4px;
+    padding: 8px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div id="board" class="board"></div>
+  <div class="panel">
+    <h1>Play vs Engine</h1>
+    <div class="row">
+      <label>Play as</label>
+      <select id="colorSelect">
+        <option value="white">White</option>
+        <option value="black">Black</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>Engine think time</label>
+      <select id="timeSelect">
+        <option value="300">Fast (0.3s)</option>
+        <option value="1000" selected>Normal (1s)</option>
+        <option value="3000">Strong (3s)</option>
+        <option value="8000">Very strong (8s)</option>
+      </select>
+    </div>
+    <div class="row">
+      <button id="newGameBtn">New Game</button>
+      <button id="undoBtn">Undo</button>
+    </div>
+    <div id="status"></div>
+    <div id="history"></div>
+  </div>
+</div>
+
+<script>
+const PIECE_GLYPH = {
+  p: "♟", n: "♞", b: "♝", r: "♜", q: "♛", k: "♚",
+  P: "♙", N: "♘", B: "♗", R: "♖", Q: "♕", K: "♔",
+};
+
+const boardEl = document.getElementById("board");
+const statusEl = document.getElementById("status");
+const historyEl = document.getElementById("history");
+const colorSelect = document.getElementById("colorSelect");
+const timeSelect = document.getElementById("timeSelect");
+
+let squares = {}; // square name -> element
+let selected = null;
+let destinations = []; // [{to, promotion}]
+let lastState = null;
+
+function squareName(file, rank) { // file 0-7 (a-h), rank 0-7 (rank8..rank1 top to bottom)
+  return "abcdefgh"[file] + (8 - rank);
+}
+
+function buildBoard() {
+  boardEl.innerHTML = "";
+  squares = {};
+  for (let rank = 0; rank < 8; rank++) {
+    for (let file = 0; file < 8; file++) {
+      const name = squareName(file, rank);
+      const el = document.createElement("div");
+      el.className = "sq " + (((file + rank) % 2 === 0) ? "light" : "dark");
+      el.dataset.square = name;
+      el.addEventListener("click", () => onSquareClick(name));
+      boardEl.appendChild(el);
+      squares[name] = el;
+    }
+  }
+}
+
+function renderFen(fen) {
+  const placement = fen.split(" ")[0];
+  const rows = placement.split("/");
+  for (const el of Object.values(squares)) el.innerHTML = "";
+
+  for (let rank = 0; rank < 8; rank++) {
+    let file = 0;
+    for (const ch of rows[rank]) {
+      if (/\d/.test(ch)) {
+        file += parseInt(ch, 10);
+      } else {
+        const name = squareName(file, rank);
+        const glyph = PIECE_GLYPH[ch] || "";
+        const cls = (ch === ch.toUpperCase()) ? "piece-white" : "piece-black";
+        squares[name].innerHTML = `<span class="${cls}">${glyph}</span>`;
+        file += 1;
+      }
+    }
+  }
+}
+
+function clearHighlights() {
+  for (const el of Object.values(squares)) {
+    el.classList.remove("selected", "dest", "king-check");
+  }
+}
+
+function findKingSquare(fen, color) {
+  const wantChar = color === "white" ? "K" : "k";
+  const placement = fen.split(" ")[0];
+  const rows = placement.split("/");
+  for (let rank = 0; rank < 8; rank++) {
+    let file = 0;
+    for (const ch of rows[rank]) {
+      if (/\d/.test(ch)) { file += parseInt(ch, 10); continue; }
+      if (ch === wantChar) return squareName(file, rank);
+      file += 1;
+    }
+  }
+  return null;
+}
+
+function renderStatus(state) {
+  statusEl.classList.remove("think", "over");
+  if (state.gameOver) {
+    statusEl.classList.add("over");
+    const winner = state.result === "checkmate"
+      ? (state.turn === "white" ? "Black" : "White") + " wins by checkmate"
+      : state.result;
+    statusEl.textContent = winner;
+  } else {
+    const who = state.turn === state.humanColor ? "Your move" : "Engine thinking...";
+    statusEl.textContent = who + (state.inCheck ? "  (check!)" : "");
+    if (who === "Engine thinking...") statusEl.classList.add("think");
+  }
+
+  historyEl.innerHTML = state.sanHistory
+    .map((san, i) => (i % 2 === 0 ? `${i / 2 + 1}. ${san}` : san))
+    .join(" ");
+  historyEl.scrollTop = historyEl.scrollHeight;
+}
+
+function applyState(state) {
+  lastState = state;
+  clearHighlights();
+  selected = null;
+  destinations = [];
+  renderFen(state.fen);
+  if (state.inCheck && !state.gameOver) {
+    const kingSq = findKingSquare(state.fen, state.turn);
+    if (kingSq) squares[kingSq].classList.add("king-check");
+  }
+  renderStatus(state);
+}
+
+async function fetchState() {
+  const res = await fetch("/api/state");
+  applyState(await res.json());
+}
+
+async function newGame() {
+  const res = await fetch("/api/new", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      humanColor: colorSelect.value,
+      movetimeMs: parseInt(timeSelect.value, 10),
+    }),
+  });
+  applyState(await res.json());
+}
+
+async function undo() {
+  const res = await fetch("/api/undo", { method: "POST" });
+  applyState(await res.json());
+}
+
+async function playMove(from, to, promotion) {
+  statusEl.textContent = "Engine thinking...";
+  statusEl.classList.add("think");
+  const res = await fetch("/api/move", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from, to, promotion: promotion || "" }),
+  });
+  const data = await res.json();
+  if (data.error) {
+    clearHighlights();
+    selected = null;
+    return;
+  }
+  applyState(data);
+}
+
+function onSquareClick(name) {
+  if (!lastState || lastState.gameOver) return;
+  if (lastState.turn !== lastState.humanColor) return; // engine's turn
+
+  if (selected === name) {
+    clearHighlights();
+    selected = null;
+    return;
+  }
+
+  const dest = destinations.find(d => d.to === name);
+  if (selected && dest) {
+    let promotion = "";
+    if (dest.promotion) {
+      promotion = (prompt("Promote to (q, r, b, n)?", "q") || "q").trim().toLowerCase();
+      if (!["q", "r", "b", "n"].includes(promotion)) promotion = "q";
+    }
+    playMove(selected, name, promotion);
+    return;
+  }
+
+  // select a new origin square
+  fetch(`/api/legal_moves?square=${name}`)
+    .then(r => r.json())
+    .then(data => {
+      clearHighlights();
+      if (data.destinations.length === 0) {
+        selected = null;
+        destinations = [];
+        return;
+      }
+      selected = name;
+      destinations = data.destinations;
+      squares[name].classList.add("selected");
+      for (const d of destinations) squares[d.to].classList.add("dest");
+    });
+}
+
+document.getElementById("newGameBtn").addEventListener("click", newGame);
+document.getElementById("undoBtn").addEventListener("click", undo);
+
+buildBoard();
+fetchState();
+</script>
+</body>
+</html>

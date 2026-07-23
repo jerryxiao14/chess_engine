@@ -1,0 +1,113 @@
+MOVE ORDERING: KILLER MOVES AND THE HISTORY HEURISTIC
+=======================================================
+
+Background: why move ordering matters at all
+----------------------------------------------
+Alpha-beta pruning only prunes well if the best move at a node tends to get
+searched first. If the first move searched is already close to the true
+best move, alpha (or beta, in negamax terms) tightens immediately and every
+subsequent sibling can be refuted quickly or skipped outright. If the best
+move is searched last, alpha-beta degrades toward examining almost the full
+tree, the same as plain minimax. In the best case (perfect ordering),
+alpha-beta cuts the effective branching factor from ~35 down to roughly its
+square root, ~6; that's the difference between a depth-6 search finishing
+in a fraction of a second and one that doesn't finish in a reasonable
+amount of time at all.
+
+The engine already has two ordering signals:
+  1. The TT best-move hint (whatever move proved best the last time this
+     exact position was searched, at any depth).
+  2. MVV-LVA (Most Valuable Victim, Least Valuable Attacker) for captures —
+     search "queen takes pawn" after "pawn takes queen", not before.
+
+Both are strong, but neither says anything about QUIET (non-capturing)
+moves. Right now all quiet moves are dumped at the back of the list in
+whatever order the move generator happened to produce them, with no
+information to tell them apart. Killer moves and the history heuristic are
+the two standard, cheap techniques for ranking quiet moves too.
+
+
+Killer moves
+------------
+Observation: if a quiet move caused a beta cutoff (a "refutation") at a
+given PLY, a sibling node at that *same ply*, in a *different* branch of
+the tree, quite often has a very similar position — same side to move,
+similar material, similar threats — because it's just a different way the
+opponent could have played two moves ago. So a move that just refuted one
+line at ply P is a disproportionately good guess for refuting a sibling
+line at ply P too, even though it's a totally different position.
+
+Implementation: keep a small fixed-size table, indexed by ply, of the last
+one or two quiet moves that caused a beta cutoff at that ply —
+killers[ply][0] and killers[ply][1] in this engine. Whenever a quiet move
+causes a cutoff, store it as killers[ply][0], shifting the previous
+killers[ply][0] into killers[ply][1] (so the table remembers the two most
+recent killers per ply, not just the single most recent). Only quiet
+moves are stored — captures already have MVV-LVA, which is a strictly
+better signal for them, and mixing the two would just add noise.
+
+At move-ordering time, a move that matches killers[ply][0] or
+killers[ply][1] gets a large ordering bonus — below the TT move and actual
+captures, but above every other quiet move. This costs O(1) table lookups
+per move and a few words of memory per ply; no search-tree information is
+discarded to make room for it.
+
+Why "at that ply" and not "in that subtree": killer moves are deliberately
+NOT position-specific (unlike the TT, which is keyed on the exact zobrist
+hash). They're a ply-indexed heuristic that says "moves like this tend to
+work well two plies from now regardless of the exact position," which is a
+much weaker but much cheaper claim than the TT's "this exact position had
+this exact best move."
+
+
+The history heuristic
+----------------------
+Killer moves only remember the last couple of cutoff moves per ply, and
+they're forgotten as soon as they're overwritten. The history heuristic
+takes the same underlying idea — "a move that has caused cutoffs before is
+likely to be good again" — and generalizes it across the WHOLE search,
+not just one ply, and with a graded score instead of a slot that gets
+evicted.
+
+Implementation: keep a table history[color][from_square][to_square]
+(or [piece][to_square]; from/to is simpler and what this engine already
+has on hand). Whenever a quiet move causes a beta cutoff at depth D, add
+D*D (or some other function that grows with depth) to that move's history
+score. Deeper cutoffs get a bigger bonus, because a cutoff found deep in
+the tree represents a conclusion that survived a lot more scrutiny than one
+found one ply from a leaf — it's a stronger signal.
+
+At move-ordering time, a quiet move that isn't the TT move or a killer is
+ranked by its history score instead of being left at a flat, undifferentiated
+score. Over the course of a search, moves like "develop the knight to a
+central square" or "castle" accumulate high scores because they're
+frequently part of a refutation across many different branches, while
+moves like "push the rook pawn one square" stay near zero.
+
+Caveat — history scores need periodic decay or normalization (commonly:
+halve the whole table between root searches, or use depth*depth accumulation
+which naturally keeps well-behaved bounds within one search). Without
+decay, scores accumulated from an early, easy position can wrongly
+dominate move ordering in a much later, unrelated position reached in the
+same game. This engine ages the table by halving it once per
+iterative-deepening call (i.e. once per "go"), which is simple and avoids
+unbounded growth across a whole game without needing per-move bookkeeping.
+
+
+Where these fit relative to what's already there
+--------------------------------------------------
+Full move ordering priority, highest to lowest:
+  1. TT best move (from a previous search of this exact position)
+  2. Captures/promotions, ranked by MVV-LVA
+  3. Killer moves for this ply (up to two)
+  4. Remaining quiet moves, ranked by history score
+
+Captures are deliberately ranked above killers/history: MVV-LVA is a
+same-position, material-grounded signal, while killers/history are
+cross-position heuristics. A capture that wins material is essentially
+always worth trying before a quiet heuristic guess, no matter how good
+that guess has been elsewhere.
+
+Both techniques are applied only in the main negamax search, not in
+quiescence — quiescence only ever considers captures (plus check evasions),
+so there are no "quiet moves" for killers/history to help order there.
